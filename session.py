@@ -8,6 +8,7 @@ from .data_structures import Data_Element, DataField
 import csv
 import pickle
 from os.path import isfile
+from threading import lock
 
 
 
@@ -16,6 +17,7 @@ class SOAPSession():
 	write_initialized = False
 	"""Class representing a SOAP session, with functions for carrying on most interaction with the SOAP interface."""
 	def __init__(self,username=soap_uname,pw=soap_pw):
+		self.lock = Lock()
 		self.username = username
 		self.pw = pw
 		self.login()
