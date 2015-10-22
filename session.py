@@ -8,7 +8,7 @@ from .data_structures import Data_Element, DataField
 import csv
 import pickle
 from os.path import isfile
-from threading import lock
+from threading import Lock
 
 
 
