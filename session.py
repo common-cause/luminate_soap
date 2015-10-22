@@ -27,7 +27,7 @@ class SOAPSession():
 			username = self.username
 		if pw is None:
 			pw = self.pw
-		sr = SOAPLogin(username,pw)
+		sr = SOAPLogin(username,pw,parent=self)
 		self.session = sr.session
 	
 	def query(self,querytext,records=100,querypage=1):
@@ -37,7 +37,7 @@ class SOAPSession():
 		
 	def request(self):
 		"""Create a new SOAP Request object as part of this session."""
-		return SOAPRequest(session=self.session)
+		return SOAPRequest(session=self.session,parent=self)
 		
 	def start_sync(self,startdate,enddate):
 		"""Starts a synchronization session with the SOAP API.
@@ -128,7 +128,7 @@ class SOAPSession():
 			self.write_initialized = True
 		self.writer.writerows(dl.list_results())
 			
-	def download(self,data_element,fields,dltype,pagesize=200,page=1):
+	def download(self,data_element,fields,dltype,pagesize=100,page=1):
 		"""Download records that were inserted/updated/deleted within the parameters of an active sync session.
 		Because of pagination limits this will need to be iterated through to capture the full set of records available, if the number is greater than 200.
 		data_element may be any valid Record type from Luminate.
