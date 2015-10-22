@@ -28,7 +28,13 @@ class SOAPRequest():
 		
 	def submit(self):
 		"""Submit the SOAP Request.  The response received is a SOAPResponse object stored as the response attribute of the SOAPRequest object."""
-		result = requests.post(soap_endpoint,ET.tostring(self.tree.getroot()))
+		self.parent.lock.acquire()
+		try:
+			result = requests.post(soap_endpoint,ET.tostring(self.tree.getroot()))
+			self.parent.lock.release()
+		except:
+			self.parent.lock.release()
+			raise
 		stripns1 = re.sub(' xmlns(?:\:[^"]+)?="[^"]+"','',result.text)
 		stripns2 = re.sub('\<\w+\:','<',stripns1)
 		stripns3 = stripns2.replace('xsi:','')
@@ -79,8 +85,8 @@ class SOAPQuery(SOAPRequest):
 
 class SOAPLogin(SOAPRequest):
 	"""Specialized class of SOAP Request for processing logins."""
-	def __init__(self,username,pw):
-		super().__init__()
+	def __init__(self,username,pw,parent=None):
+		super().__init__(parent=parent)
 		login = element(soap,'Login',parent=self.body)
 		u = element(urn,'UserName',parent=login,text=username)
 		p = element(urn,'Password',parent=login,text=pw)
