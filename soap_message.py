@@ -7,6 +7,8 @@ from .local_settings import *
 import re
 import lxml.etree as ET		
 
+	
+
 class SOAPRequest():
 	"""Generalized class for constructing and submitting SOAP Requests.
 	Optional arguments:
@@ -17,10 +19,10 @@ class SOAPRequest():
 	def __init__(self,session='',parent=None):
 		self.envelope = element(soap,'Envelope')
 		self.parent = parent
+		
+		
 		self.tree = ET.ElementTree(self.envelope)
 		self.header = element(soap,'Header',parent=self.envelope)
-		if parent is not None:
-			self.parent = parent
 		if session != '':
 			s = element(soap,'Session',parent=self.header)
 			self.sid = element(soap,'SessionId',parent=s,text=session)
@@ -28,12 +30,15 @@ class SOAPRequest():
 		
 	def submit(self):
 		"""Submit the SOAP Request.  The response received is a SOAPResponse object stored as the response attribute of the SOAPRequest object."""
-		self.parent.lock.acquire()
+		if self.parent is not None:
+			self.parent.lock.acquire()
 		try:
 			result = requests.post(soap_endpoint,ET.tostring(self.tree.getroot()))
-			self.parent.lock.release()
+			if self.parent is not None:
+				self.parent.lock.release()
 		except:
-			self.parent.lock.release()
+			if self.parent is not None:
+				self.parent.lock.release()
 			raise
 		stripns1 = re.sub(' xmlns(?:\:[^"]+)?="[^"]+"','',result.text)
 		stripns2 = re.sub('\<\w+\:','<',stripns1)
@@ -75,8 +80,8 @@ class SOAPRequest():
 		
 class SOAPQuery(SOAPRequest):	
 	"""Specialized class of SOAP request for queries."""
-	def __init__(self,session,querytext,records=100,querypage=1):
-		super().__init__(session=session)
+	def __init__(self,session,querytext,parent=None,records=100,querypage=1):
+		super().__init__(session=session,parent=parent)
 		self.query = element(urn,'Query',parent=self.body)
 		qt = element(urn,'QueryString',parent=self.query,text=querytext)
 		qp = element(urn,'Page',parent=self.query,text=str(querypage))
