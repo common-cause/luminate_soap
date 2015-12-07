@@ -13,9 +13,9 @@ from threading import Lock
 
 
 class SOAPSession():
+	"""Class representing a SOAP session, with functions for carrying on most interaction with the SOAP interface."""
 	write_open = False
 	write_initialized = False
-	"""Class representing a SOAP session, with functions for carrying on most interaction with the SOAP interface."""
 	def __init__(self,username=soap_uname,pw=soap_pw):
 		self.lock = Lock()
 		self.username = username
@@ -36,6 +36,9 @@ class SOAPSession():
 		"""Deliver a SQL query to Luminate and return the SOAP Response object returned."""
 		qr = SOAPQuery(self.session,querytext,records=records,querypage=querypage)
 		return qr.response
+		
+	def find(self):
+		pass
 		
 	def request(self):
 		"""Create a new SOAP Request object as part of this session."""
