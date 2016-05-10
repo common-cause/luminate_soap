@@ -4,7 +4,7 @@ from .exceptions import *
 from .soap_message import SOAPLogin, SOAPRequest, SOAPQuery
 from .utilities import element
 from .interface_data import recordtypes as ifdrec
-from .data_structures import Data_Element, DataField
+from .data_structures import Data_Element, DataField, recordtypes
 import csv
 import pickle
 from os.path import isfile
@@ -32,9 +32,9 @@ class SOAPSession():
 		sr = SOAPLogin(username,pw,parent=self)
 		self.session = sr.session
 	
-	def query(self,querytext,records=100,querypage=1):
+	def query(self,querytext,pagesize=100,page=1):
 		"""Deliver a SQL query to Luminate and return the SOAP Response object returned."""
-		qr = SOAPQuery(self.session,querytext,records=records,querypage=querypage)
+		qr = SOAPQuery(self.session,querytext,pagesize=pagesize,page=page)
 		return qr.response
 		
 	def find(self):
@@ -141,7 +141,8 @@ class SOAPSession():
 		operation = syncsessiontags[dltype]
 		self._sync_op_checks(data_element,operation)
 		sr = self.request()
-		fields.sort(key=lambda f: recordtypes[data_element].fields[f].num)
+		r = recordtypes[data_element]
+		fields = r.prepsort(fields)
 		req = element(urn,operation,parent=sr.body)
 		p = element(urn,'PartitionId',parent=req,text=soap_partition)
 		rt = element(urn,'RecordType',parent=req,text=data_element)
@@ -155,7 +156,6 @@ class SOAPSession():
 		
 		return sr.response
 		
-				
 	def gettypedescription(self,data_element):
 		"""Requests the type description of a Record type from Luminate.
 		Returns a Data_Element object of that type."""
@@ -177,13 +177,6 @@ def purge_descriptions():
 		pickle.dump(recordtypes,descr_file,protocol=3)
 	del ss
 	
-
-try:
-	with open(soap_path + 'record_descriptions.pk3','rb') as descr_file:
-		recordtypes = pickle.load(descr_file)
-except (FileNotFoundError, AttributeError):
-	recordtypes = purge_descriptions()
-
 
 def check_op_validity(data_element,operation):
 	"""Function that checks the module-level dictionary of Luminate record types to confirm whether the operation named by the operation argument
