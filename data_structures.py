@@ -1,6 +1,17 @@
-
+from .local_settings import soap_path
+import pickle
 
 field_params_std = ['Name','Writable','Custom','Nillable','Multiple','Type','MaxLength','IsCriterion','IsWildcard']
+
+
+
+def getname(field_obj):
+	if type(field_obj) == str:
+		return field_obj
+	elif type(field_obj) == tuple:
+		return field_obj[0]
+	else:
+		raise TypeError('Not string or tuple')
 
 class Data_Element():
 	"""Class for holding the descriptions of Luminate internal data elements.
@@ -17,6 +28,23 @@ class Data_Element():
 			self.fields[field.find('Name').text] = DataField(field,fieldnum)
 			self.fieldsbynum[fieldnum] = self.fields[field.find('Name').text]
 			fieldnum +=1
+	
+	def prepsort(self,fields):
+		fields.sort(key = lambda f: self.fields[getname(f)].num)
+		ret = []
+		for field in fields:
+			if type(field) == str:
+				ret.append(field)
+			elif type(field) == tuple:
+				(el, elfields) = field
+				rec = recordtypes[self.fields[el]['Type']]
+				elfields = rec.prepsort(elfields)
+				for elf in elfields:
+					ret.append(el + '.' + elf)
+			else:
+				raise TypeError('this is a %s' % str(type(field)))
+		return ret
+
 		
 class DataField():
 	"""Class for holding the description of Luminate data fields.
@@ -39,7 +67,7 @@ class DataField():
 				self.codes[option.find('Value').text] = option.find('Name').text
 				
 	def __getitem__(self,x):
-		return self.characterist
+		return self.characteristics[x]
 	
 	def parse(val):
 		"""For luminate fields that use integers to encode string values, return the string value given the integer as an argument."""
@@ -47,3 +75,10 @@ class DataField():
 			return self.codes[val]
 		else:
 			return val
+			
+			
+try:
+	with open(soap_path + 'record_descriptions.pk3','rb') as descr_file:
+		recordtypes = pickle.load(descr_file)
+except FileNotFoundError:
+	recordtypes = {}
