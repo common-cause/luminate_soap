@@ -2,7 +2,7 @@
 
 import requests
 from .utilities import element
-from .exceptions import SOAPError
+from .exceptions import SOAPError, SOAPClientError
 from .local_settings import *
 import re
 import lxml.etree as ET		
@@ -80,12 +80,12 @@ class SOAPRequest():
 		
 class SOAPQuery(SOAPRequest):	
 	"""Specialized class of SOAP request for queries."""
-	def __init__(self,session,querytext,parent=None,records=100,querypage=1):
+	def __init__(self,session,querytext,parent=None,pagesize=100,page=1):
 		super().__init__(session=session,parent=parent)
 		self.query = element(urn,'Query',parent=self.body)
 		qt = element(urn,'QueryString',parent=self.query,text=querytext)
-		qp = element(urn,'Page',parent=self.query,text=str(querypage))
-		qs = element(urn,'PageSize',parent=self.query,text=str(records))
+		qp = element(urn,'Page',parent=self.query,text=str(page))
+		qs = element(urn,'PageSize',parent=self.query,text=str(pagesize))
 		self.submit()
 
 class SOAPLogin(SOAPRequest):
@@ -108,22 +108,48 @@ class SOAPResponse():
 	
 	def results_header(self):
 		"""Returns the list of field names downloaded in this SOAP Response"""
-		return [el.tag for el in self.tree.find('.//Record').iter() if (el.text is not None and not re.match('\n\s+',el.text)) or el.get('nil') == 'true']
-	
-	def list_results(self):
+		longest = 0
+		for rec in self.tree.iterfind('.//Record'):
+			if rec.xpath('count(.//*)') > longest:
+				longestrec = rec
+		try:
+			return [el.tag for el in longestrec.iter() if (el.text is not None and not re.match('\n\s+',el.text)) or el.get('nil') == 'true']
+		except UnboundLocalError:
+			return []
+		
+	def list_results(self,header=''):
 		"""Returns a list of the records in the xml document, with each record as a list of the values in that record.  
 		Values are presented in the same order as fields in the field header.
 		Values are not decoded; integer codes in Luminate are presented as integers."""
+		if header == '':
+			header = self.results_header()
+		else:
+			caps = self.results_header()
+			lower = [col.lower() for col in caps]
+			for i in range(len(header)):
+				try:
+					header[i] = caps[lower.index(header[i])]
+				except ValueError:
+					pass
 		results = []
 		for rec in self.tree.iterfind('.//Record'):
 			row = []
-			for el in rec.iter():
-				if el.text is not None and not re.match('\n\s+',el.text):
-					row.append(el.text)
-				elif el.get('nil') == 'true':
+			for col in header:
+				els = [el for el in rec.iterfind('.//' + col)]
+				if len(els) == 0:
 					row.append('')
 				else:
-					pass
+					toappend = []
+					for el in els:
+						if el.text is not None and not re.match('\n\s+',el.text):
+							#we're going to strip out tabs here because they appear in certain text fields, and screw up our db upload
+							toappend.append(el.text.replace('\t','').replace('\\','').replace('\n',' '))
+						elif el.get('nil') == 'true':
+							toappend.append('')
+					if len(toappend) == 1:
+						row.append(toappend[0])
+					else:
+						row.append(toappend)
 			results.append(row)
 		return results
 	
