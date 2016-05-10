@@ -6,24 +6,26 @@ from os import chdir
 from csv import reader
 from .utilities import log
 from .exceptions import SOAPError
-from .database import curs
+from .database import curs, DBThread
 import pickle
 from threading import Thread, Lock
 from requests.exceptions import RequestException
 from queue import Queue
 from .local_settings import settings, debug
-from psycopg2 import IntegrityError, DatabaseError, OperationalError
+from psycopg2 import IntegrityError, DatabaseError, OperationalError, ProgrammingError
 from io import StringIO
 from math import floor
+from datetime import date
 
 workerthreads = settings['workerthreads']
 
 #these represent the practical limits to how many records the interface will return; documentation says it will support 200 at a go but this is not true for all record types
-pagelimits = {'EmailRecipient' : 200, 'Constituent' : 100, 'ActionAlertResponse' : 100} 
+pagelimits = {'EmailRecipient' : 100, 'Constituent' : 100, 'ActionAlertResponse' : 100,'ActionAlert' : 100, 'EmailCampaign' : 100,
+'EmailDelivery' : 1, 'EmailMessage' : 100, 'Donation' : 100, 'GroupType' : 100, 'DonationForm' : 100} 
 #use this for sorting queried records
-timefields = {('Constituent','insert') : 'CreationDate', ('Constituent','update') : 'ModifyDate', ('ActionAlertResponse','insert') : 'SubmitDate'}
-pks = {'Constituent' : 'ConsId', 'ActionAlertResponse' : 'AlertResponseId'}
-
+timefields = {'insert' : 'CreationDate', 'update': 'ModifyDate', ('ActionAlertResponse','insert') : 'SubmitDate',('GroupType','insert') : None}
+pks = {'Constituent' : 'ConsId', 'ActionAlertResponse' : 'AlertResponseId', 'Donation' : 'TransactionId'}
+dontquery = ['Donation']
 
 
 class DownloadThread(Thread):
@@ -48,93 +50,57 @@ class DownloadThread(Thread):
 					if debug:
 						print('%s beginning work on %s %s page %s' % (self.name,opn,op,str(page)))
 					response = self.session.download(el,fields,op,pagesize=pagelimits[el],page=page)
-
+					results = response.list_results()
+					self.db_queue.put((soap,opn,el,op,page,response))
 				elif soap == 'qu':					
-					#for a query we need to explicitly load the date range because it's not embedded in the sync
-					(sdate, edate, page) = pageparams
+					#for a query we need to explicitly load the date range or other criteria because it's not embedded in the sync
+					(type, page) = (pageparams[0], pageparams[-1])
 					if debug:
 						print('%s beginning work on %s %s page %s' % (self.name,opn,op,str(page)))
 					# now we assemble the query text
 					qstring = "SELECT "
 					fieldsstring = ', '.join(fields)
 					qstring += fieldsstring
-					timefield = timefields[(el,op)]
-					sortfield = timefields[(el,'insert')]
-					qstring += " WHERE %s >= '%sT00:00:00+0000' AND %s <= '%sT23:59:59+0000' ORDER BY %s" % (timefield, sdate, timefield, edate, sortfield)
+					
+					qstring += " FROM %s" % el
+					#get the right fields to constrain the time range and sort to put things in chronological order
+					try:
+						sortfield = timefields[(el,'insert')]
+					except KeyError:
+						sortfield = fields[0]
+					
+					if type == 'time':
+						try:
+							timefield = timefields[(el,op)]
+						except KeyError:
+							timefield = timefields[op]
+
+						if timefield is not None:
+							qstring += " WHERE %s >= %sT00:00:00+0000 AND %s <= %sT23:59:59+0000 ORDER BY %s" % (timefield, pageparams[1], timefield, pageparams[2], sortfield)
+						else:
+							sortfield = fields[0]
+					elif type == 'other':
+						if pageparams[1] is not None:
+							qstring += ' ' + pageparams[1]
+					
+						qstring += " ORDER BY %s" % sortfield
+					if debug:
+						print(qstring)
 					response = self.session.query(qstring,pagesize=pagelimits[el],page=str(page))
-					if len(response.list_results()) == 0:
+					results = response.list_results()
+					if len(results) == 0:
 						self.parent.blankpage = page
-				self.db_queue.put((soap,opn,el,op,page,response.list_results()))
+					else:
+						self.db_queue.put((soap,opn,el,op,page,response))
 				if debug:
 					print('downloaded page %s of %s %s results; success!' % (str(page), el, op))
 			except RequestException:
 				self.db_queue.put((soap,opn,el,op,page,'HTTP ERROR'))
 			except Exception as e:
-				self.db_queue.put((soap,opn,el,op,page,'UNHANDLED EXCEPTION %s' % str(e).replace("'","''")))
+				self.db_queue.put((soap,opn,el,op,page,'UNHANDLED EXCEPTION %s, %s' % (e.__class__.__name__, str(e).replace("'","''"))))
+				raise
 			self.task_queue.task_done()
 			
-			
-class DBThread(Thread):
-	def __init__(self,db,db_queue,start_date,end_date,group=None,target=None,name=None):
-		super().__init__(group=group,target=target,name=name)
-		self.daemon = True
-		self.db = db
-		self.db_queue = db_queue
-		self.start_date = start_date
-		self.end_date = end_date
-		print('DBThread Initiated')
-		
-	def run(self):
-		while True:
-			(soap,opn,el,op,page,data) = self.db_queue.get()
-			if debug:
-				print('dbthread working on page %s of %s %s' % (str(page),opn, op))
-			try:
-				assert type(data) == list
-				#in all cases except constituent group relationships the data that's coming across is ready to be written to the db.
-				#For cons/group relationships we need to split each row into multiple rows of consid - groupid
-				if opn == 'ConsGroupRel':
-					olddata = data
-					data = []
-					for consrecord in olddata:
-						for grpid in consrecord[1:]:
-							data.append([consrecord[0],grpid])
-				results = StringIO('\n'.join(['\t'.join(row) for row in data]))
-				try:
-					self.db.copy_from(results,opn + '_loader',null='')
-					self.progress_insert((opn,op,page),'C')
-				except DatabaseError:
-					self.db = curs()
-					self.db.copy_from(results,opn + '_loader',null='')
-					self.progress_insert((opn,op,page),'C')
-				except OperationalError:
-					self.db = curs()
-					self.db_queue.put((opn, el, op, page, data))
-					self.progress_insert((opn,op,page),'C')
-				except:
-					self.db.execute('rollback;')
-					self.progress_insert((opn,op,page),'D')
-					raise
-			except AssertionError:
-				try:
-					self.db.execute("INSERT INTO sync_errors (opname, operation, start_date, end_Date, page, error_message, event_time) VALUES ('%s','%s','%s','%s',%s,'%s',current_timestamp);" % (opn, op, self.start_date, self.end_date, str(page), data))
-					self.db.execute('COMMIT;')
-					if data == 'HTTP ERROR':
-						errcode = 'E'
-					else:
-						errcode = 'U'
-					self.progress_insert((opn,op,page),errcode)
-				except:
-					self.db_queue.put(opn, el, op, page, data)
-					self.db = curs()
-			self.db_queue.task_done()
-			if debug:
-				print('dbthread task done')
-					
-	def progress_insert(self,records,code):
-		(opn, op, page) = (records[0], records[1], str(records[2]))
-		self.db.execute("SELECT sync_progress_update('%s','%s','%s','%s',%s,'%s');" % (opn, op, self.start_date, self.end_date, page, code))
-		self.db.execute('COMMIT;')
 
 
 class Controller():
@@ -142,23 +108,16 @@ class Controller():
 		self.session = SOAPSession()
 		self.db = None
 		self.sync = None
-		
-	def db_connect(self):
-		if self.db is None:
-			self.db = curs()
-		
-	def db_sync(self,syncstart,syncend,ops=None):
-		self.db_connect()
-		if ops is None:
-			self.db.execute('SELECT element, operation FROM sync_ops')
-			ops = self.db.fetchall()
-		self.db.execute('COMMIT;')
+		self.threads = {}
 		self.task_queue = Queue()
 		self.db_queue = Queue()
-		self.dbthread = DBThread(curs(),self.db_queue,syncstart,syncend,name='db')
-		#start independently threaded processes for managing the downloads from the database and uploads to the database
-		threads = {}
+		self.db_connect()
+		self.dbthread = DBThread(self.db,self.db_queue,start_date=None,end_date=None,name='db')
+		self.dbthread.start()
+		print('controller not totally shitting the bed')
+		self.threads = {}
 		for i in range(workerthreads):
+			print('working on workerthread %s' % str(i))
 			sessions = {1:self.session}
 			sessnum = floor(i/2) + 1
 			try:
@@ -174,71 +133,136 @@ class Controller():
 						session.start_sync(syncstart,syncend)
 					else:
 						raise
-			threads[i] = DownloadThread(self,session,self.task_queue,self.db_queue,name='worker'+str(i))
-			threads[i].start()
-		self.dbthread.start()
+			self.threads[i] = DownloadThread(self,session,self.task_queue,self.db_queue,name='worker'+str(i))
+			self.threads[i].start()
+		
+	def db_connect(self):
+		if self.db is None:
+			self.db = curs()
+		
+	def db_sync_by_days(self,syncstart,syncend,ops):
+		self.db.execute('SELECT populate_days();')  #populate the days table up to the present date
+		self.db.execute('COMMIT;')
 		for (opn, op) in ops:
-			#if we can use download ops we'll use those; we can get a page count and run the operation to completion
-			self.db.execute("SELECT element FROM sync_ops WHERE opname = '%s' AND operation = '%s'" % (opn, op))
-			el = self.db.fetchone()[0]
-			if recordtypes[el].ops['GetIncremental' + op.capitalize() + 's'] == 'true':
-				(pages, complete) = self.sync_status(opn,el,op,syncstart,syncend)
-				if complete == 'N':
-					self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'C'" % (opn,op,syncstart,syncend))
-					completed = self.db.fetchall()
-					self.db.execute('COMMIT;')
-					self.db.execute("SELECT field FROM luminate_fields WHERE opname = '%s';" % (opn,))
-					fields = [res[0] for res in self.db.fetchall()]
-					for i in range(1,pages+1):
-						if i not in [int(rec[0]) for rec in completed]:
-							self.task_queue.put(('dl',opn,el,op,fields,i))
-					self.task_queue.join()
-					self.db_queue.join()
-					self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'H'" % (opn, op, syncstart, syncend))
-					for i in self.db.fetchall():
-						self.task_queue.put(('dl',opn,el,op,fields,i))
-					self.task_queue.join()
-					self.db_queue.join()
+			self.db.execute("SELECT cd.past_date FROM convio_days cd WHERE cd.past_date BETWEEN '%s' AND '%s' AND NOT EXISTS (SELECT 'X' FROM sync_event e WHERE cd.past_date BETWEEN e.start_date AND e.end_date AND e.opname = '%s' AND e.operation = '%s')" % (syncstart, syncend, opn, op))
+			days_to_sync = [data_row[0] for data_row in self.db.fetchall()]
+			for sync_day in days_to_sync:
+				print('trying to sync %s %s for %s' %(opn, op, sync_day.isoformat()))
+				self.db_sync_one(opn,op,sync_day.isoformat(),sync_day.isoformat())
+				
+	def __sync__(self,opn, el, op, syncstart, syncend):
+		(pages, complete) = self.sync_status(opn,el,op,syncstart,syncend)
+		if complete == 'N':
+			self.db.execute('COMMIT;')
+			self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opn,))
+			dlfields = [(res[0], res[1]) for res in self.db.fetchall()]
+			#need to lump together specified subfields that are children of the same parent category
+			dlfields.sort(key = lambda f: str(f[1]))
+			fields = []
+			i = 0
+			while i < len(dlfields):
+				(fname, parent) = dlfields[i]
+				if parent is None:
+					fields.append(fname)
+					i += 1
+				else:
+					current_parent = parent
+					children = []
+					while current_parent == parent:
+						children.append(fname)
+						i += 1
+						try:
+							(fname, parent) = dlfields[i]
+						except IndexError:
+							break
+					fields.append((current_parent,children))								
+				
+			for i in range(1,pages+1):
+				self.task_queue.put(('dl',opn,el,op,fields,i))
+			self.task_queue.join()
+			self.db_queue.join()
+			self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'H'" % (opn, op, syncstart, syncend))
+			for i in self.db.fetchall():
+				self.task_queue.put(('dl',opn,el,op,fields,i))
+			self.task_queue.join()
+			self.db_queue.join()
+			
+	def __query__(self,opn, el, op, syncstart = None, syncend = None, altwhere = None):
+		self.blankpage = None
+		if syncstart is None:
+			(syncstart, syncend) = ('2014-06-01', date.today().isoformat())
+		
+		(pages, complete) = self.query_status(opn, el, op, syncstart, syncend)
 
-			#need a different routine for when we're querying, because we won't be able to get a count
-			elif recordtypes[el].ops['Query'] == 'true':
-				self.blankpage = None
-				(pages, complete) = self.query_status(opn, el, op, syncstart, syncend)
-				if complete == 'N':
-					if pages is not None:
-						self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'C'" % (opn,op,syncstart,syncend))
-						completed = self.db.fetchall()
-						self.db.execute('COMMIT;')
-					self.db.execute("SELECT field FROM luminate_fields WHERE opname = '%s';" % (opn,))
-					fields = [res[0] for res in self.db.fetchall()]
-					page = 1
-					while True:
-						if page not in [int(rec[0]) for rec in completed]:
-							#if we pass 
-							self.task_queue.put('qu',opn,el,op,fields,(syncstart,syncend,page))
-							self.task_queue.join()
-							if self.blankpage is None:
-								page += 1
-							else:
-								self.db.execute("UPDATE sync_event SET pages = %s WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s'" % (str(self.blankpage-1),opn, op, sdate, edate))
-								self.db.execute("COMMIT;")
-								break
-					self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'H'" % (opn, op, syncstart, syncend))
-					for i in self.db.fetchall():
-						self.task_queue.put('qu',opn,el,op,fields,(syncstart,syncend,i))
-					self.task_queue.join()
-					self.db_queue.join()
+		if complete == 'N':
+			completed = []
+			if pages is not None:
+				self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'C'" % (opn,op,syncstart,syncend))
+				completed = self.db.fetchall()
+				self.db.execute('COMMIT;')
+			self.db.execute("SELECT field FROM luminate_fields WHERE opname = '%s';" % (opn,))
+			fields = [res[0] for res in self.db.fetchall()]
+			page = 1
+			if syncstart is not None:
+				instructions = ['time', syncstart, syncend]
 			else:
-				raise SOAPError('attempted operation with no compatible option on the SOAP interface')
-					
+				instructions = ['other', altwhere]
+			while True:
+				if page not in [int(rec[0]) for rec in completed]:
+					#if we pass 
+					self.task_queue.put(('qu',opn,el,op,fields,instructions + [page]))
+					self.task_queue.join()
+					if self.blankpage is None:
+						page += 1
+					else:
+						self.db.execute("UPDATE sync_event SET pages = %s WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s'" % (str(self.blankpage-1),opn, op, syncstart, syncend))
+						self.db.execute("COMMIT;")
+						break
+			self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'H'" % (opn, op, syncstart, syncend))
+			try:
+				for i in self.db.fetchall():
+					self.task_queue.put('qu',opn,el,op,fields,('time',syncstart,syncend,i))
+			except ProgrammingError:
+				pass
+			self.task_queue.join()
+			self.db_queue.join()
+		
+		
+	def db_sync_one(self,opn,op,syncstart,syncend):
+		self.db.execute("SELECT element FROM sync_ops WHERE opname = '%s' AND operation = '%s'" % (opn, op))
+		el = self.db.fetchone()[0]
+		if debug:
+			print("syncing one, el is %s" % el)
+		syncvals = (opn, op, syncstart, syncend)
+		self.db.execute('DELETE FROM %s_loader;' % opn)
+		self.db.execute("DELETE FROM sync_event e WHERE e.opname = '%s' AND e.operation = '%s' AND e.start_date = '%s' AND e.end_date = '%s' AND e.completed = 'N'" % syncvals)
+		self.dbthread.start_date = syncstart
+		self.dbthread.end_date = syncend
+		#find out what operations the SOAP interface supports for this element
+		validops = recordtypes[el].ops
+		#querying is faster, so try that first
+		if validops['Query'] == 'true' and opn not in dontquery:
+			self.__query__(opn,el,op,syncstart=syncstart,syncend=syncend)
+		elif validops['GetIncremental' + op.capitalize() + 's'] == 'true':
+			self.__sync__(opn, el, op, syncstart, syncend)
+
+		else:
+			raise SOAPError('attempted operation with no compatible option on the SOAP interface')
+								
+		self.db.execute("SELECT is_complete('%s','%s','%s','%s')" % syncvals )
+		complete = self.db.fetchone()[0]
+		self.db.execute('COMMIT;')
+		if complete:
+			print('the sync op succeeded')
 			self.db.execute("SELECT db_load('%s','%s')" % (opn,op))
+			self.db.execute("UPDATE sync_event e SET completed = 'Y' WHERE e.opname = '%s' AND e.operation = '%s' AND e.start_date = '%s' AND e.end_date = '%s'" % syncvals)
 			self.db.execute('COMMIT;')
-			syncvals = (opn, op, syncstart, syncend)
-			self.db.execute("SELECT is_complete('%s','%s','%s','%s')" % syncvals )
-			complete = self.db.fetchone()[0]
 			self.db.execute('COMMIT;')
-			if complete:
-				self.db.execute("UPDATE sync_event e SET completed = 'Y' WHERE e.opname = '%s' AND e.operation = '%s' AND e.start_date = '%s' AND e.end_date = '%s'" % syncvals)
+		else:
+			print ('the sync op failed')
+			self.db.execute('DELETE FROM %s_loader;' % opn)
+			self.db.execute("DELETE FROM sync_event e WHERE e.opname = '%s' AND e.operation = '%s' AND e.start_date = '%s' AND e.end_date = '%s'" % syncvals)
+			self.db.execute('COMMIT;')
 				
 	def patch(self,opn):
 		self.db_connect()
@@ -251,7 +275,9 @@ class Controller():
 		self.db.execute("COMMIT")
 		pk = pks[el]
 		while True:
-			self.db.execute("SELECT %s FROM %s_gaps WHERE resolved = 'N' LIMIT 100" % (pk, el))
+			if debug:
+				print('running a patch job')
+			self.db.execute("SELECT %s FROM %s_gaps WHERE resolved = 'N' LIMIT 100" % (pk, opn))
 			ids = [rec[0] for rec in self.db.fetchall()]
 			if len(ids) == 0:
 				break
@@ -261,22 +287,42 @@ class Controller():
 
 			qstring = "SELECT " + fieldstring + ' FROM ' + el + ' WHERE ' + pk + ' = ' + idstring
 			r = self.session.query(qstring)
-			data = r.list_results()
+			self.db.execute("SELECT column_name FROM information_schema.columns WHERE table_name = '%s_loader' ORDER BY ordinal_position" % opn.lower())
+			header = [col[0] for col in self.db.fetchall()]
+			data = r.list_results(header=header)
+			self.db.execute('COMMIT;')
 			if opn == 'ConsGroupRel':
+				print('doing cgr fix')
 				olddata = data
 				data = []
 				for consrecord in olddata:
-					for grpid in consrecord[1:]:
+					for grpid in consrecord[1]:
+						print('appending a row')
 						data.append([consrecord[0],grpid])
 			results = StringIO('\n'.join(['\t'.join(row) for row in data]))
+			print('uploading')
 			self.db.copy_from(results,opn + '_loader',null='')
 			self.db.execute("UPDATE %s_gaps g SET resolved = 'Y' WHERE %s = %s" % (el, pk, idstring))
+			print('marking completed')
 			self.db.execute("SELECT db_load('%s','insert')" % (el,))
 			self.db.execute("COMMIT;")
 
-				
+	def dl_group(self,groupid):
+		self.db.execute('SELECT wipe_group(%s);' % str(groupid))
+		self.db.execute('COMMIT');
+		(start_date, end_date) = ('2014-06-01', date.today().isoformat())
+		dump = self.query_status('ConsGroupRel','Constituent','update',start_date, end_date)
+		self.dbthread.start_date = start_date
+		self.dbthread.end_date = end_date
+		self.__query__('ConsGroupRel','Constituent','update',altwhere = 'WHERE groupid = %s' % str(groupid))
+		self.db.execute("SELECT db_load('ConsGroupRel','update')")
+		self.db.execute("DELETE FROM sync_ops WHERE opname = 'ConsGroupRel' AND start_date = '%s' AND end_date = '%s'" % (start_date, end_date))
+		self.db.execute("COMMIT;")
+		
 				
 	def query_status(self, opn, el, op, start_date, end_date):
+		print("fetching query status")
+		print ("SELECT * FROM sync_event WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s'" % (opn,op,start_date,end_date))
 		self.db.execute("SELECT * FROM sync_event WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s'" % (opn,op,start_date,end_date))	
 		status = self.db.fetchone()
 		self.db.execute('COMMIT;')
@@ -285,7 +331,10 @@ class Controller():
 			self.db.execute("COMMIT;")
 			return(None, 'N')
 		else:
-			return(int(status[4]), status[5])
+			try:
+				return(int(status[4]), status[5])
+			except TypeError:
+				return(None, status[5])
 			
 	def sync_status(self, opn, el,op, start_date, end_date):
 		self.start_sync(start_date,end_date)
