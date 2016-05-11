@@ -188,5 +188,5 @@ def check_op_validity(data_element,operation):
 	except AssertionError:
 		raise SOAPClientError('Attempted invalid operation %s on record type %s' % (operation, data_element))
 		
-if recordtypes = {}:
+if recordtypes == {}:
 	purge_descriptions()
