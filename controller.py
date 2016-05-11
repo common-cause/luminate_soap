@@ -112,7 +112,7 @@ class Controller():
 		self.task_queue = Queue()
 		self.db_queue = Queue()
 		self.db_connect()
-		self.dbthread = DBThread(self.db,self.db_queue,start_date=None,end_date=None,name='db')
+		self.dbthread = DBThread(curs(),self.db_queue,start_date=None,end_date=None,name='db')
 		self.dbthread.start()
 		print('controller not totally shitting the bed')
 		self.threads = {}
@@ -144,7 +144,7 @@ class Controller():
 		self.db.execute('SELECT populate_days();')  #populate the days table up to the present date
 		self.db.execute('COMMIT;')
 		for (opn, op) in ops:
-			self.db.execute("SELECT cd.past_date FROM convio_days cd WHERE cd.past_date BETWEEN '%s' AND '%s' AND NOT EXISTS (SELECT 'X' FROM sync_event e WHERE cd.past_date BETWEEN e.start_date AND e.end_date AND e.opname = '%s' AND e.operation = '%s')" % (syncstart, syncend, opn, op))
+			self.db.execute("SELECT cd.past_date FROM convio_days cd WHERE cd.past_date BETWEEN '%s' AND '%s' AND NOT EXISTS (SELECT 'X' FROM sync_event e WHERE cd.past_date BETWEEN e.start_date AND e.end_date AND e.opname = '%s' AND e.operation = '%s' AND e.completed = 'Y')" % (syncstart, syncend, opn, op))
 			days_to_sync = [data_row[0] for data_row in self.db.fetchall()]
 			for sync_day in days_to_sync:
 				print('trying to sync %s %s for %s' %(opn, op, sync_day.isoformat()))
