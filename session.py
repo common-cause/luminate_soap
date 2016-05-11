@@ -173,7 +173,7 @@ def purge_descriptions():
 	recordtypes = {}
 	for data_el in ifdrec:
 		recordtypes[data_el] = ss.gettypedescription(data_el)
-	with open('record_descriptions.pk3','wb') as descr_file:
+	with open(soap_path + '/record_descriptions.pk3','wb') as descr_file:
 		pickle.dump(recordtypes,descr_file,protocol=3)
 	del ss
 	
@@ -187,3 +187,6 @@ def check_op_validity(data_element,operation):
 		assert record_desc.ops[operation.replace('Count','')] == 'true'
 	except AssertionError:
 		raise SOAPClientError('Attempted invalid operation %s on record type %s' % (operation, data_element))
+		
+if recordtypes = {}:
+	purge_descriptions()
