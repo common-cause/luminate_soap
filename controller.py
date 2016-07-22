@@ -4,7 +4,7 @@
 from .session import SOAPSession, recordtypes
 from os import chdir
 from csv import reader
-from .utilities import log
+from .utilities import  isodate_to_jsdate
 from .exceptions import SOAPError
 from .database import curs, DBThread
 import pickle
@@ -16,16 +16,18 @@ from psycopg2 import IntegrityError, DatabaseError, OperationalError, Programmin
 from io import StringIO
 from math import floor
 from datetime import date
+from time import mktime
 
 workerthreads = settings['workerthreads']
 
 #these represent the practical limits to how many records the interface will return; documentation says it will support 200 at a go but this is not true for all record types
 pagelimits = {'EmailRecipient' : 100, 'Constituent' : 100, 'ActionAlertResponse' : 100,'ActionAlert' : 100, 'EmailCampaign' : 100,
-'EmailDelivery' : 1, 'EmailMessage' : 100, 'Donation' : 100, 'GroupType' : 100, 'DonationForm' : 100} 
+'EmailDelivery' : 1, 'EmailMessage' : 100, 'Donation' : 100, 'GroupType' : 100, 'DonationForm' : 100, 'CalendarEvent' : 100, 'Survey' : 100} 
 #use this for sorting queried records
 timefields = {'insert' : 'CreationDate', 'update': 'ModifyDate', ('ActionAlertResponse','insert') : 'SubmitDate',('GroupType','insert') : None}
 pks = {'Constituent' : 'ConsId', 'ActionAlertResponse' : 'AlertResponseId', 'Donation' : 'TransactionId'}
 dontquery = ['Donation']
+longdates = ['CalendarEvent']
 
 
 class DownloadThread(Thread):
@@ -76,7 +78,10 @@ class DownloadThread(Thread):
 							timefield = timefields[op]
 
 						if timefield is not None:
-							qstring += " WHERE %s >= %sT00:00:00+0000 AND %s <= %sT23:59:59+0000 ORDER BY %s" % (timefield, pageparams[1], timefield, pageparams[2], sortfield)
+							if el not in longdates:
+								qstring += " WHERE %s >= %sT00:00:00+0000 AND %s <= %sT23:59:59+0000 ORDER BY %s" % (timefield, pageparams[1], timefield, pageparams[2], sortfield)
+							else:
+								qstring += " WHERE %s >= %s AND %s <= %s ORDER BY %s" % (timefield, str(isodate_to_jsdate(pageparams[1])), timefield, str(isodate_to_jsdate(pageparams[2])), sortfield)
 						else:
 							sortfield = fields[0]
 					elif type == 'other':
@@ -125,14 +130,7 @@ class Controller():
 			except KeyError:
 				session = SOAPSession(username=settings['account' + str(sessnum)],pw=settings['pw' + str(sessnum)])
 				sessions[sessnum] = session
-				try:
-					session.start_sync(syncstart,syncend)
-				except SOAPError as e:
-					if e.faultcode == 'CLIENT':
-						session.end_sync()
-						session.start_sync(syncstart,syncend)
-					else:
-						raise
+
 			self.threads[i] = DownloadThread(self,session,self.task_queue,self.db_queue,name='worker'+str(i))
 			self.threads[i].start()
 		
@@ -149,33 +147,29 @@ class Controller():
 			for sync_day in days_to_sync:
 				print('trying to sync %s %s for %s' %(opn, op, sync_day.isoformat()))
 				self.db_sync_one(opn,op,sync_day.isoformat(),sync_day.isoformat())
-				
+	
+	def __prep_fields__(self,opname, el):
+		self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opname,))
+		dlfields = [(res[0], res[1]) for res in self.db.fetchall()]			
+		self.db.execute('COMMIT;')
+		#need to get the syntax right for fields where we have a parent record type to access them through.
+		el_obj = recordtypes[el]
+		dlfields.sort(key=lambda x: get_fieldsortkey(el_obj,x))
+		fields = []
+		i = 0
+		while i < len(dlfields):
+			(fname, parent) = dlfields[i]
+			if parent is None:
+				fields.append(fname)
+			else:
+				fields.append(parent + '.' + fname)
+			i += 1				
+		return fields		
+		
 	def __sync__(self,opn, el, op, syncstart, syncend):
 		(pages, complete) = self.sync_status(opn,el,op,syncstart,syncend)
 		if complete == 'N':
-			self.db.execute('COMMIT;')
-			self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opn,))
-			dlfields = [(res[0], res[1]) for res in self.db.fetchall()]
-			#need to lump together specified subfields that are children of the same parent category
-			dlfields.sort(key = lambda f: str(f[1]))
-			fields = []
-			i = 0
-			while i < len(dlfields):
-				(fname, parent) = dlfields[i]
-				if parent is None:
-					fields.append(fname)
-					i += 1
-				else:
-					current_parent = parent
-					children = []
-					while current_parent == parent:
-						children.append(fname)
-						i += 1
-						try:
-							(fname, parent) = dlfields[i]
-						except IndexError:
-							break
-					fields.append((current_parent,children))								
+			fields= self.__prep_fields__(opn,el)
 				
 			for i in range(1,pages+1):
 				self.task_queue.put(('dl',opn,el,op,fields,i))
@@ -200,8 +194,8 @@ class Controller():
 				self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'C'" % (opn,op,syncstart,syncend))
 				completed = self.db.fetchall()
 				self.db.execute('COMMIT;')
-			self.db.execute("SELECT field FROM luminate_fields WHERE opname = '%s';" % (opn,))
-			fields = [res[0] for res in self.db.fetchall()]
+			self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opn,))
+			fields= self.__prep_fields__(opn,el)
 			page = 1
 			if syncstart is not None:
 				instructions = ['time', syncstart, syncend]
@@ -291,8 +285,8 @@ class Controller():
 			header = [col[0] for col in self.db.fetchall()]
 			data = r.list_results(header=header)
 			self.db.execute('COMMIT;')
-			if opn == 'ConsGroupRel':
-				print('doing cgr fix')
+			if opn[-3:] == 'Rel':
+				print('doing relation table fix')
 				olddata = data
 				data = []
 				for consrecord in olddata:
@@ -361,40 +355,6 @@ class Controller():
 				raise
 		self.sync = (start_date,end_date)
 		
-	def sync_ops(self,start_date,end_date,fprefix,optuples,progressdata=None):
-		"""Carry out a full set of sync operations.  Can be a new set of instructions or resuming a previous set.
-		Takes the arguments:
-		start_date - isoformatted start date of the sync window
-		end_date - isoformatted end date of the sync window
-		fprefix - prefix which will be prepended to the name of all files generated by this operation
-		optuples - a list of tuples, of the form (data_element, op, [list, of, fields]) specifying what to download
-		progressdata - if applicable, an dictionary object indicating how much of each download has already been completed, of the form {(data_element, op) : pages, ...}"""
-		log('Initiating a sync session from %s to %s' % (start_date,end_date))
-		self.progress = {}
-		try:
-			assert progressdata is None
-		except AssertionError:
-			self.progress=progressdata
-		
-		self.start_sync(start_date,end_date)
-
-		for (data_element,op,fields) in optuples:
-			records = self.session.getcount(data_element,op)
-			pages = (records - records % 200) / 200 + 1
-			try:
-				page = self.progress.get((data_element,op)) + 1
-			except TypeError:
-				page = 1
-			while page <= pages:
-				try:
-					self.download_pages(data_element,fields,op,page,min(page+49,pages),fprefix + '-' + data_element + '-' + op + '.csv',newfile=page==1)
-					page += 50
-				except:
-					self.progress[(data_element,op)]+= -1
-					with open(fprefix + '_progress.pk3','wb') as progressdump:
-						pickle.dump(self.progress,progressdump,protocol=3)
-					raise
-	
 	def sync_from_folder(self,folder):
 		"""Designate a folder containing a guidefile containing instructions for download ops.
 		Format of the guidefile should be as follows:
@@ -413,19 +373,21 @@ class Controller():
 		except FileNotFoundError:
 			progress = None
 		self.sync_ops(start_date, end_date, prefix, instructions,progressdata=progress)
+
+def get_fieldsortkey(el_obj,fieldtuple):
+	"""function generates a sortkey that places fields in an order that the Luminate interface will permit, using 
+	information downloaded from Luminate about data structures."""
+	(level2, level1) = fieldtuple
+	if level1 is None:
+		sortkey =  'c.0000' + str(el_obj.fields[level2].num)
+		sortkey = sortkey[-4:]
+
+	else:
+		sortkey = '0000' + str(el_obj.fields[level1].num)
+		sortkey = sortkey[-4:] + '.'
+		secondel = recordtypes[el_obj.fields[level1]['Type']]
+		sortkey2 = '0000' + str(secondel.fields[level2].num)
+		sortkey += sortkey2[-4:]
 		
-		
-	def download_pages(self,data_element,fields,op,startpage,endpage,destfile,newfile=True):
-		if newfile:
-			self.session._prep_writefile(destfile)
-		else:
-			self.session._append_writefile(destfile)
-		
-		while startpage <= endpage:
-			self.session.dl_write(data_element,fields,op,page=startpage)
-			startpage += 1
-			if startpage % 10 == 0:
-				self.session.writefile.flush()
-			self.progress[(data_element,op)] = startpage
-		log('Downloaded pages %s to %s of %s records from the %s set to %s.' % (str(startpage), str(endpage), data_element, op, destfile))
-		
+	return sortkey
+	
