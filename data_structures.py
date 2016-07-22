@@ -69,7 +69,7 @@ class DataField():
 	def __getitem__(self,x):
 		return self.characteristics[x]
 	
-	def parse(val):
+	def parse(self,val):
 		"""For luminate fields that use integers to encode string values, return the string value given the integer as an argument."""
 		if self.is_coded:
 			return self.codes[val]
