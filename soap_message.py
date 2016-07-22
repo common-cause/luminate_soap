@@ -86,8 +86,12 @@ class SOAPQuery(SOAPRequest):
 		qt = element(urn,'QueryString',parent=self.query,text=querytext)
 		qp = element(urn,'Page',parent=self.query,text=str(page))
 		qs = element(urn,'PageSize',parent=self.query,text=str(pagesize))
-		self.submit()
-
+		try:
+			self.submit()
+		except SOAPError:
+			print('page = %s, pagesize = %s, query = %s' % (str(page), str(pagesize), querytext))
+			raise
+			
 class SOAPLogin(SOAPRequest):
 	"""Specialized class of SOAP Request for processing logins."""
 	def __init__(self,username,pw,parent=None):
