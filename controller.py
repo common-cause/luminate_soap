@@ -11,7 +11,7 @@ import pickle
 from threading import Thread, Lock
 from requests.exceptions import RequestException
 from queue import Queue
-from .local_settings import settings, debug
+from .local_settings import settings, debug, pagelimits, timefields, pks,longdates
 from psycopg2 import IntegrityError, DatabaseError, OperationalError, ProgrammingError
 from io import StringIO
 from math import floor
@@ -21,13 +21,8 @@ from time import mktime
 workerthreads = settings['workerthreads']
 
 #these represent the practical limits to how many records the interface will return; documentation says it will support 200 at a go but this is not true for all record types
-pagelimits = {'EmailRecipient' : 100, 'Constituent' : 100, 'ActionAlertResponse' : 100,'ActionAlert' : 100, 'EmailCampaign' : 100,
-'EmailDelivery' : 1, 'EmailMessage' : 100, 'Donation' : 100, 'GroupType' : 100, 'DonationForm' : 100, 'CalendarEvent' : 100, 'Survey' : 100} 
-#use this for sorting queried records
-timefields = {'insert' : 'CreationDate', 'update': 'ModifyDate', ('ActionAlertResponse','insert') : 'SubmitDate',('GroupType','insert') : None}
-pks = {'Constituent' : 'ConsId', 'ActionAlertResponse' : 'AlertResponseId', 'Donation' : 'TransactionId'}
+
 dontquery = ['Donation']
-longdates = ['CalendarEvent']
 
 
 class DownloadThread(Thread):
@@ -44,65 +39,32 @@ class DownloadThread(Thread):
 	
 	def run(self):
 		while True:
-			(soap, opn, el, op,fields,pageparams) = self.task_queue.get()
+			inst = self.task_queue.get()
 			
 			try:
-				if soap == 'dl':
-					page = pageparams
+				if inst.soap == 'dl':
 					if debug:
-						print('%s beginning work on %s %s page %s' % (self.name,opn,op,str(page)))
-					response = self.session.download(el,fields,op,pagesize=pagelimits[el],page=page)
+						print('%s beginning work on %s %s page %s' % (self.name,inst.opn,inst.op,str(inst.page)))
+					response = self.session.download(inst.el,inst.fields,inst.op,pagesize=pagelimits[inst.el],page=inst.page)
 					results = response.list_results()
-					self.db_queue.put((soap,opn,el,op,page,response))
-				elif soap == 'qu':					
+					self.db_queue.put((inst.soap,inst.opn,inst.el,inst.op,inst.page,response))
+				elif inst.soap == 'qu':					
 					#for a query we need to explicitly load the date range or other criteria because it's not embedded in the sync
-					(type, page) = (pageparams[0], pageparams[-1])
 					if debug:
-						print('%s beginning work on %s %s page %s' % (self.name,opn,op,str(page)))
-					# now we assemble the query text
-					qstring = "SELECT "
-					fieldsstring = ', '.join(fields)
-					qstring += fieldsstring
-					
-					qstring += " FROM %s" % el
-					#get the right fields to constrain the time range and sort to put things in chronological order
-					try:
-						sortfield = timefields[(el,'insert')]
-					except KeyError:
-						sortfield = fields[0]
-					
-					if type == 'time':
-						try:
-							timefield = timefields[(el,op)]
-						except KeyError:
-							timefield = timefields[op]
+						print('%s beginning work on %s %s page %s' % (self.name,inst.opn,inst.op,str(inst.page)))
 
-						if timefield is not None:
-							if el not in longdates:
-								qstring += " WHERE %s >= %sT00:00:00+0000 AND %s <= %sT23:59:59+0000 ORDER BY %s" % (timefield, pageparams[1], timefield, pageparams[2], sortfield)
-							else:
-								qstring += " WHERE %s >= %s AND %s <= %s ORDER BY %s" % (timefield, str(isodate_to_jsdate(pageparams[1])), timefield, str(isodate_to_jsdate(pageparams[2])), sortfield)
-						else:
-							sortfield = fields[0]
-					elif type == 'other':
-						if pageparams[1] is not None:
-							qstring += ' ' + pageparams[1]
-					
-						qstring += " ORDER BY %s" % sortfield
-					if debug:
-						print(qstring)
-					response = self.session.query(qstring,pagesize=pagelimits[el],page=str(page))
+					response = self.session.query_fields(inst.el,inst.fields,inst.op,start_date=inst.startdate,end_date=inst.enddate,page=inst.page,querytype=inst.querytype,)
 					results = response.list_results()
 					if len(results) == 0:
-						self.parent.blankpage = page
+						self.parent.blankpage = inst.page
 					else:
-						self.db_queue.put((soap,opn,el,op,page,response))
+						self.db_queue.put((inst.soap,inst.opn,inst.el,inst.op,inst.page,response))
 				if debug:
-					print('downloaded page %s of %s %s results; success!' % (str(page), el, op))
+					print('downloaded page %s of %s %s results; success!' % (str(inst.page), inst.el, inst.op))
 			except RequestException:
-				self.db_queue.put((soap,opn,el,op,page,'HTTP ERROR'))
+				self.db_queue.put((inst.soap,inst.opn,inst.el,inst.op,inst.page,'HTTP ERROR'))
 			except Exception as e:
-				self.db_queue.put((soap,opn,el,op,page,'UNHANDLED EXCEPTION %s, %s' % (e.__class__.__name__, str(e).replace("'","''"))))
+				self.db_queue.put((inst.soap,inst.opn,inst.el,inst.op,inst.page,'UNHANDLED EXCEPTION %s, %s' % (e.__class__.__name__, str(e).replace("'","''"))))
 				raise
 			self.task_queue.task_done()
 			
@@ -148,36 +110,39 @@ class Controller():
 				print('trying to sync %s %s for %s' %(opn, op, sync_day.isoformat()))
 				self.db_sync_one(opn,op,sync_day.isoformat(),sync_day.isoformat())
 	
-	def __prep_fields__(self,opname, el):
+	def __get_fields__(self,opname, el):
 		self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opname,))
-		dlfields = [(res[0], res[1]) for res in self.db.fetchall()]			
+		dlfields = [(res[0], res[1]) for res in self.db.fetchall()]	
 		self.db.execute('COMMIT;')
+		#this is commented out because I moved the sorting task into the data_structures.DataElement.prepsort function
 		#need to get the syntax right for fields where we have a parent record type to access them through.
-		el_obj = recordtypes[el]
-		dlfields.sort(key=lambda x: get_fieldsortkey(el_obj,x))
+		#el_obj = recordtypes[el]
+		#dlfields.sort(key=lambda x: get_fieldsortkey(el_obj,x))
 		fields = []
 		i = 0
 		while i < len(dlfields):
 			(fname, parent) = dlfields[i]
 			if parent is None:
-				fields.append(fname)
+				fields.append((parent,fname))
 			else:
-				fields.append(parent + '.' + fname)
+				fields.append((parent,fname))
 			i += 1				
 		return fields		
 		
 	def __sync__(self,opn, el, op, syncstart, syncend):
 		(pages, complete) = self.sync_status(opn,el,op,syncstart,syncend)
 		if complete == 'N':
-			fields= self.__prep_fields__(opn,el)
+			fields= self.__get_fields__(opn,el)
 				
 			for i in range(1,pages+1):
-				self.task_queue.put(('dl',opn,el,op,fields,i))
+				inst = Download_Instructions('dl',opn,el,op,fields,i)
+				self.task_queue.put(inst)
 			self.task_queue.join()
 			self.db_queue.join()
 			self.db.execute("SELECT page FROM sync_progress WHERE opname = '%s' AND operation = '%s' AND start_date = '%s' AND end_date = '%s' AND status = 'H'" % (opn, op, syncstart, syncend))
 			for i in self.db.fetchall():
-				self.task_queue.put(('dl',opn,el,op,fields,i))
+				inst = Download_Instructions('dl',opn,el,op,fields,i)
+				self.task_queue.put(inst)
 			self.task_queue.join()
 			self.db_queue.join()
 			
@@ -195,16 +160,17 @@ class Controller():
 				completed = self.db.fetchall()
 				self.db.execute('COMMIT;')
 			self.db.execute("SELECT field, parent FROM luminate_fields WHERE opname = '%s';" % (opn,))
-			fields= self.__prep_fields__(opn,el)
-			page = 1
+			fields= self.__get_fields__(opn,el)
 			if syncstart is not None:
-				instructions = ['time', syncstart, syncend]
+				type = 'time'
 			else:
-				instructions = ['other', altwhere]
+				type = 'other'
+			page = 1
 			while True:
 				if page not in [int(rec[0]) for rec in completed]:
 					#if we pass 
-					self.task_queue.put(('qu',opn,el,op,fields,instructions + [page]))
+					inst = Download_Instructions('qu',opn,el,op,fields,page,querytype=type,startdate=syncstart,enddate=syncend)
+					self.task_queue.put(inst)
 					self.task_queue.join()
 					if self.blankpage is None:
 						page += 1
@@ -300,18 +266,19 @@ class Controller():
 			print('marking completed')
 			self.db.execute("SELECT db_load('%s','insert')" % (el,))
 			self.db.execute("COMMIT;")
-
-	def dl_group(self,groupid):
-		self.db.execute('SELECT wipe_group(%s);' % str(groupid))
-		self.db.execute('COMMIT');
-		(start_date, end_date) = ('2014-06-01', date.today().isoformat())
-		dump = self.query_status('ConsGroupRel','Constituent','update',start_date, end_date)
-		self.dbthread.start_date = start_date
-		self.dbthread.end_date = end_date
-		self.__query__('ConsGroupRel','Constituent','update',altwhere = 'WHERE groupid = %s' % str(groupid))
-		self.db.execute("SELECT db_load('ConsGroupRel','update')")
-		self.db.execute("DELETE FROM sync_ops WHERE opname = 'ConsGroupRel' AND start_date = '%s' AND end_date = '%s'" % (start_date, end_date))
-		self.db.execute("COMMIT;")
+			
+#this was a concept that I toyed with but eventually abandoned for getting group memberships without creating a giant table.
+#	def dl_group(self,groupid):
+#		self.db.execute('SELECT wipe_group(%s);' % str(groupid))
+#		self.db.execute('COMMIT');
+#		(start_date, end_date) = ('2014-06-01', date.today().isoformat())
+#		dump = self.query_status('ConsGroupRel','Constituent','update',start_date, end_date)
+#		self.dbthread.start_date = start_date
+#		self.dbthread.end_date = end_date
+#		self.__query__('ConsGroupRel','Constituent','update',altwhere = 'WHERE groupid = %s' % str(groupid))
+#		self.db.execute("SELECT db_load('ConsGroupRel','update')")
+#		self.db.execute("DELETE FROM sync_ops WHERE opname = 'ConsGroupRel' AND start_date = '%s' AND end_date = '%s'" % (start_date, end_date))
+#		self.db.execute("COMMIT;")
 		
 				
 	def query_status(self, opn, el, op, start_date, end_date):
@@ -374,20 +341,18 @@ class Controller():
 			progress = None
 		self.sync_ops(start_date, end_date, prefix, instructions,progressdata=progress)
 
-def get_fieldsortkey(el_obj,fieldtuple):
-	"""function generates a sortkey that places fields in an order that the Luminate interface will permit, using 
-	information downloaded from Luminate about data structures."""
-	(level2, level1) = fieldtuple
-	if level1 is None:
-		sortkey =  'c.0000' + str(el_obj.fields[level2].num)
-		sortkey = sortkey[-4:]
 
-	else:
-		sortkey = '0000' + str(el_obj.fields[level1].num)
-		sortkey = sortkey[-4:] + '.'
-		secondel = recordtypes[el_obj.fields[level1]['Type']]
-		sortkey2 = '0000' + str(secondel.fields[level2].num)
-		sortkey += sortkey2[-4:]
+
+class Download_Instructions():
+	def __init__(self,soap, opn, el, op,fields,page,startdate=None,enddate=None,querytype=None,whereclause=None):
+		self.soap = soap
+		self.opn = opn
+		self.el = el
+		self.op = op
+		self.fields = fields
+		self.page = page
+		self.querytype = querytype
+		self.whereclause = whereclause
+		self.startdate=startdate
+		self.enddate=enddate
 		
-	return sortkey
-	

@@ -2,13 +2,12 @@
 from .local_settings import *
 from .exceptions import *
 from .soap_message import SOAPLogin, SOAPRequest, SOAPQuery
-from .utilities import element
+from .utilities import element,  isodate_to_jsdate
 from .interface_data import recordtypes as ifdrec
 from .data_structures import Data_Element, DataField, recordtypes
-import csv
 import pickle
-from os.path import isfile
 from threading import Lock
+timefields = {'insert' : 'CreationDate', 'update': 'ModifyDate', ('ActionAlertResponse','insert') : 'SubmitDate',('GroupType','insert') : None}
 
 
 
@@ -33,9 +32,46 @@ class SOAPSession():
 		self.session = sr.session
 	
 	def query(self,querytext,pagesize=100,page=1):
-		"""Deliver a SQL query to Luminate and return the SOAP Response object returned."""
+		"""Deliver a SQL query to Luminate and return the SOAP Response object returned.  Takes the query text as input."""
 		qr = SOAPQuery(self.session,querytext,pagesize=pagesize,page=page)
 		return qr.response
+	
+	def query_fields(self,data_element,fields,op,start_date=None,end_date=None,pagesize=100,page=1,querytype='time',whereclause=None):
+		"""Do a query type download, taking the parameters of the download instead of the query text as the inputs."""
+		r = recordtypes[data_element]
+		#the fields have been passed as a list of tuples (parent, child), where parent may be None.  We need to assign proper ordering and
+		#sort them into the only order that the interface will recognize
+		fields = r.prepsort(fields)
+		qstring = "SELECT "
+		fieldsstring = ', '.join(fields)
+		qstring += fieldsstring
+		qstring += " FROM %s" % data_element
+		#get the right fields to constrain the time range and sort to put things in chronological order
+		try:
+			#if we can sort by time, do that
+			sortfield = timefields[(data_element,'insert')]
+		except KeyError:
+			#otherwise just sort by the first field.  Only matters that we're consistent.
+			sortfield = fields[0]
+		#for most queries the WHERE clause will consist of a time window from which we are getting records
+		if querytype == 'time':
+			try:
+				timefield = timefields[(data_element,op)]
+			except KeyError:
+				timefield = timefields[op]
+			#almost all timefields are stored as isodates, but one is a javascript style long integer
+			if data_element not in longdates:
+				qstring += " WHERE %s >= %sT00:00:00+0000 AND %s <= %sT23:59:59+0000 ORDER BY %s" % (timefield, start_date, timefield, end_date, sortfield)
+			else:
+				qstring += " WHERE %s >= %s AND %s <= %s ORDER BY %s" % (timefield, str(isodate_to_jsdate(start_date)), timefield, str(isodate_to_jsdate(end_date)), sortfield)
+		elif querytype == 'other':
+			#if the query type is "other" we just use the WHERE clause passed in the function call
+			qstring += ' ' + whereclause + ' ORDER BY %s' % sortfield
+		
+		if debug:
+			print(qstring)
+		return self.query(qstring,pagesize=pagesize,page=page)
+		
 		
 	def find(self):
 		pass

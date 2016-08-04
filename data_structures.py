@@ -30,19 +30,13 @@ class Data_Element():
 			fieldnum +=1
 	
 	def prepsort(self,fields):
-		fields.sort(key = lambda f: self.fields[getname(f)].num)
+		fields.sort(key = lambda f: get_fieldsortkey(self,f))
 		ret = []
-		for field in fields:
-			if type(field) == str:
+		for (parent,field) in fields:
+			if parent is None:
 				ret.append(field)
-			elif type(field) == tuple:
-				(el, elfields) = field
-				rec = recordtypes[self.fields[el]['Type']]
-				elfields = rec.prepsort(elfields)
-				for elf in elfields:
-					ret.append(el + '.' + elf)
 			else:
-				raise TypeError('this is a %s' % str(type(field)))
+				ret.append(parent + '.' + field)
 		return ret
 
 		
@@ -75,7 +69,25 @@ class DataField():
 			return self.codes[val]
 		else:
 			return val
-			
+		
+def get_fieldsortkey(el_obj,fieldtuple):
+	"""function generates a sortkey that places fields in an order that the Luminate interface will permit, using 
+	information downloaded from Luminate about data structures."""
+	(level1, level2) = fieldtuple
+	if level1 is None:
+		sortkey =  'c.0000' + str(el_obj.fields[level2].num)
+		sortkey = sortkey[-4:]
+
+	else:
+		sortkey = '0000' + str(el_obj.fields[level1].num)
+		sortkey = sortkey[-4:] + '.'
+		secondel = recordtypes[el_obj.fields[level1]['Type']]
+		sortkey2 = '0000' + str(secondel.fields[level2].num)
+		sortkey += sortkey2[-4:]
+		
+	return sortkey		
+		
+
 			
 try:
 	with open(soap_path + 'record_descriptions.pk3','rb') as descr_file:
